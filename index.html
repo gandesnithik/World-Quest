@@ -451,6 +451,10 @@ $('tQ').onclick=()=>{lowQ=!lowQ;applyQ()};
 $('tFS').onclick=()=>{const e=document.documentElement;try{document.fullscreenElement?document.exitFullscreen():(e.requestFullscreen||e.webkitRequestFullscreen).call(e)}catch(x){}};
 if(coarse){shadowsOn=true;lowQ=true;applyQ();$('tQ').textContent='Graphics: Low'}
 $('bSolo').onclick=()=>{err();audio();room=null;showSetup()};
+$('bHow').onclick=()=>openHow();$('pHow').onclick=()=>openHow();
+function openHow(){$('how').classList.remove('hide');$('how').style.zIndex=30}
+$('howX').onclick=()=>$('how').classList.add('hide');
+$('htabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;[...$('htabs').children].forEach(x=>x.classList.toggle('sel',x==b));document.querySelectorAll('.how').forEach((s,i)=>s.classList.toggle('on',i==+b.dataset.t))};
 $('bBack').onclick=()=>show('home');
 $('bStart').onclick=()=>{audio();seed='solo'+Math.random();startGame(Date.now()+400,lvI)};
 
