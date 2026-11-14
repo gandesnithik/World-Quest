@@ -232,48 +232,74 @@ let shadowsOn=true,soundOn=true,lowQ=coarse,prevIds={};
 let me=null,P=null,OBJ=null,SITE=null,COL=[],ITEMS=[],IM={},DEP={},remotes={},W=[],FL=[],fireLight=null;
 let K={},runT=false,jx=0,jy=0,jmag=0,cy=0,cp=.35,camD=6.5,act=0,mrot=0,lastPres=0,sleeping=0,zapCd=0,rn=0,flash=0,lastD=1,lastSy=1,lastDay=0,wsT=3,respT=0,camX=0,camZ=0;
 
-/* ================= online multiplayer: Firebase Auth + Realtime Database ================= */
+/* ================= online multiplayer: Firebase Auth + Realtime Database =================
+   Database layout (matches database.rules.json):
+   rooms/{code}/info                {owner, lk, createdAt}
+   rooms/{code}/members/{uid}       player presence (position, hero, name, ready ...)
+   rooms/{code}/events/{id}         {uid, type, data, t}      game events
+   rooms/{code}/messages/{id}       {uid, name, text, ts, c, mid}   chat                       */
 const MAXP=6,NETERR={taken:'Could not create room. Try again.',notfound:'Room not found or expired.',busy:'Game already started.',full:'Room is full.',net:'Could not reach the multiplayer service.'};
+const PRES_KEYS=['nm','ch','lv','rdy','dead','act','hp','x','y','z','yaw','startAt'];
 const clean=o=>o===undefined?null:JSON.parse(JSON.stringify(o));
+function fbMsg(e,where){const c=String((e&&(e.code||e.message))||'error'),all=c+' '+String((e&&e.message)||'');
+ if(/permission[_ -]denied/i.test(all))return 'permission denied'+(where?' at '+where:'')+' - publish database.rules.json';
+ if(/operation-not-allowed/.test(all))return 'Anonymous sign-in is not enabled in Firebase';
+ if(/api-key|API key/i.test(all))return 'invalid Firebase apiKey';
+ if(/unauthorized-domain/.test(all))return 'domain not authorized in Firebase';
+ if(/configuration-not-found/.test(all))return 'Firebase Authentication is not set up';
+ if(/network|unavailable|offline/i.test(all))return 'network problem';
+ return c.slice(0,70)}
 class FbRoom{
- constructor(F,code,host){this.F=F;this.code=code;this.host=host;this.id=null;this.mem={};this.order=[];this.hl={};this.pl=[];this.dead=false;this.nt=0;this.so=0;this.off=0;this.onClose=null;this.pend={};this.ft=0;this.lastF=0;this.un=[];this.had=false}
- now(){return Date.now()+this.so}
- async open(){const f=this.F.fn,db=this.F.db,auth=this.F.auth;
+ constructor(F,code,owner){this.F=F;this.code=code;this.isOwner=owner;this.id=null;this.ownerId=null;this.mem={};this.order=[];this.hl={};this.pl=[];this.dead=false;this.nt=0;this.so=0;this.onClose=null;this.onError=null;this.pend={};this.ft=0;this.lastF=0;this.un=[];this.had=false;this.clockOk=false;this.errSeen={};this.clk=F.clock||Date.now}
+ get off(){return this.so}
+ now(){return this.clk()+this.so}
+ rep(where,e){const m=fbMsg(e,where);try{console.error('[World Quest / Firebase]',where,e)}catch(x){}if(!this.errSeen[m]){this.errSeen[m]=1;setTimeout(()=>{delete this.errSeen[m]},8000);this.onError&&this.onError(m)}return m}
+ syncClock(){return new Promise(res=>{const f=this.F.fn;let done=false;const fin=()=>{if(!done){done=true;clearTimeout(to);res()}},to=setTimeout(fin,4000);
+  this.un.push(f.onValue(f.ref(this.F.db,'.info/serverTimeOffset'),s=>{this.so=+s.val()||0;this.clockOk=true;fin()},e=>{this.rep('clock',e);fin()}))})}
+ async open(){const f=this.F.fn,db=this.F.db,auth=this.F.auth;let step='sign-in';
   try{
    if(!auth.currentUser)await f.signInAnonymously(auth);
-   this.id=auth.currentUser.uid;this.rr=f.ref(db,'rooms/'+this.code);const meta=f.child(this.rr,'meta');
-   try{const s=await f.get(f.ref(db,'.info/serverTimeOffset'));this.so=+s.val()||0;this.off=this.so}catch(e){}
-   if(this.host){const r=await f.runTransaction(meta,cur=>cur?undefined:{host:this.id,lk:0,t:Date.now()});if(!r.committed)throw Object.assign(new Error('taken'),{code:'taken'})}
-   else{const m=await f.get(meta);if(!m.exists())throw Object.assign(new Error('nf'),{code:'notfound'});if(m.val().lk)throw Object.assign(new Error('busy'),{code:'busy'});
-    const ms=await f.get(f.child(this.rr,'members'));if(ms.exists()&&Object.keys(ms.val()).length>=MAXP)throw Object.assign(new Error('full'),{code:'full'})}
-   this.had=true;const mref=this.mref=f.child(this.rr,'members/'+this.id);
-   await f.onDisconnect(mref).remove();if(this.host)await f.onDisconnect(this.rr).remove();
-   this.mem[this.id]={pr:{j:this.now()}};await f.set(mref,{j:this.now()});
-   const mb=f.child(this.rr,'members'),upd=s=>{if(s.key==this.id){this.sortO();this.notify();return}this.mem[s.key]={pr:s.val()||{}};this.sortO();this.notify()};
-   this.un.push(f.onChildAdded(mb,upd),f.onChildChanged(mb,s=>{if(s.key==this.id)return;upd(s)}),f.onChildRemoved(mb,s=>{delete this.mem[s.key];this.sortO();this.notify()}));
-   this.un.push(f.onValue(meta,s=>{if(s.exists())this.had=true;else if(this.had)this.closed()}));
-   const evr=this.evr=f.child(this.rr,'ev'),mk=f.push(evr).key;
-   this.un.push(f.onChildAdded(f.query(evr,f.orderByKey(),f.startAfter(mk)),s=>{const v=s.val();if(!v||v.f===this.id)return;const h=this.hl[v.e];if(h)h({isMe:false,peer:v.f,data:v.d})}));
+   this.id=auth.currentUser.uid;this.rr=f.ref(db,'rooms/'+this.code);const info=this.info=f.child(this.rr,'info');
+   step='clock';await this.syncClock();
+   if(this.isOwner){step='create room';const r=await f.runTransaction(info,cur=>cur?undefined:{owner:this.id,lk:0,createdAt:this.now()});if(!r.committed)throw Object.assign(new Error('taken'),{code:'taken'});this.ownerId=this.id}
+   else{step='read room';const m=await f.get(info);if(!m.exists())throw Object.assign(new Error('nf'),{code:'notfound'});const v=m.val();if(v.lk)throw Object.assign(new Error('busy'),{code:'busy'});this.ownerId=v.owner}
+   this.had=true;step='join room';const mref=this.mref=f.child(this.rr,'members/'+this.id);
+   await f.onDisconnect(mref).remove();if(this.isOwner)await f.onDisconnect(this.rr).remove();
+   try{await f.set(mref,{j:this.now()})}catch(e){if(!this.isOwner){let m2=null;try{m2=await f.get(info)}catch(x){}if(m2&&!m2.exists())throw Object.assign(new Error('nf'),{code:'notfound'});if(m2&&m2.exists()&&m2.val().lk)throw Object.assign(new Error('busy'),{code:'busy'})}throw e}
+   this.mem[this.id]={pr:{j:this.now()}};
+   step='members';const mb=f.child(this.rr,'members'),er=e=>this.rep('members',e);
+   const upd=s=>{if(s.key==this.id){this.sortO();this.notify();return}this.mem[s.key]={pr:s.val()||{}};this.sortO();this.notify()};
+   this.un.push(f.onChildAdded(mb,upd,er),f.onChildChanged(mb,upd,er),f.onChildRemoved(mb,s=>{delete this.mem[s.key];this.sortO();this.notify()},er));
+   const ms=await f.get(mb),ids=Object.entries(ms.val()||{}).sort((a,b)=>((a[1].j||0)-(b[1].j||0))||(a[0]<b[0]?-1:1)).map(x=>x[0]);
+   if(ids.indexOf(this.id)>=MAXP){try{await f.remove(mref)}catch(x){}throw Object.assign(new Error('full'),{code:'full'})}
+   step='room info';this.un.push(f.onValue(info,s=>{if(s.exists()){this.had=true;const v=s.val();this.ownerId=v.owner;this.lk=v.lk;this.sortO();this.notify()}else if(this.had)this.closed()},e=>this.rep('info',e)));
+   step='events';const evr=this.evr=f.child(this.rr,'events'),mk=f.push(evr).key;
+   this.un.push(f.onChildAdded(f.query(evr,f.orderByKey(),f.startAfter(mk)),s=>{const v=s.val();if(!v||v.uid===this.id)return;const h=this.hl[v.type];if(h)h({isMe:false,peer:v.uid,data:v.data})},e=>this.rep('events',e)));
+   step='chat';const msr=this.msr=f.child(this.rr,'messages'),mk2=f.push(msr).key;
+   this.un.push(f.onChildAdded(f.query(msr,f.orderByKey(),f.startAfter(mk2)),s=>{const v=s.val();if(!v||v.uid===this.id)return;const h=this.hl.chat;if(h)h({isMe:false,peer:v.uid,data:{id:v.mid,n:v.name,c:v.c,t:v.text,ts:v.ts}})},e=>this.rep('messages',e)));
    return this;
-  }catch(e){this.destroy();if(e&&NETERR[e.code])throw e;throw Object.assign(new Error('net'),{code:'net',detail:(e&&(e.code||e.message))||'error'})}}
- sortO(){this.order=Object.keys(this.mem).sort((a,b)=>((this.mem[a].pr.host?-1:0)-(this.mem[b].pr.host?-1:0))||((this.mem[a].pr.j||0)-(this.mem[b].pr.j||0))||(a<b?-1:1))}
+  }catch(e){this.destroy();if(e&&NETERR[e.code])throw e;throw Object.assign(new Error('net'),{code:'net',detail:fbMsg(e,step)+' ['+step+']'})}}
+ sortO(){this.order=Object.keys(this.mem).sort((a,b)=>((a==this.ownerId?-1:0)-(b==this.ownerId?-1:0))||((this.mem[a].pr.j||0)-(this.mem[b].pr.j||0))||(a<b?-1:1))}
  on(e,f){this.hl[e]=f}
  onPeers(f){this.pl.push(f)}
- peers(){return this.order.filter(k=>this.mem[k]).map(k=>({peer:k,isMe:k==this.id,presence:this.mem[k].pr}))}
+ peers(){return this.order.filter(k=>this.mem[k]).map(k=>({peer:k,isMe:k==this.id,presence:Object.assign({},this.mem[k].pr,{owner:k==this.ownerId?1:0},k==this.ownerId?{lk:this.lk?1:0}:{})}))}
  notify(){if(this.nt||this.dead)return;this.nt=setTimeout(()=>{this.nt=0;const ps=this.peers();this.pl.forEach(f=>{try{f({peers:ps,left:[]})}catch(e){console.error(e)}})},40)}
- async presence(o){if(this.dead)return;const c=clean(o);this.mem[this.id]=this.mem[this.id]||{pr:{}};Object.assign(this.mem[this.id].pr,c);Object.assign(this.pend,c);
-  if(this.host&&c.lk!==undefined)this.F.fn.update(this.F.fn.child(this.rr,'meta'),{lk:c.lk}).catch(()=>{});
-  this.notify();const gap=Date.now()-this.lastF;if(gap>=100)return this.flush();if(!this.ft)this.ft=setTimeout(()=>{this.ft=0;this.flush()},100-gap)}
- flush(){if(this.dead||!this.mref)return;const p=this.pend;this.pend={};this.lastF=Date.now();if(!Object.keys(p).length)return;return this.F.fn.update(this.mref,p).catch(()=>{})}
- emit(e,d){if(this.dead)return;const f=this.F.fn,r=f.push(this.evr);f.set(r,{f:this.id,e,d:clean(d)}).catch(()=>{});setTimeout(()=>{f.remove(r).catch(()=>{})},8000)}
+ async presence(o){if(this.dead)return;const c=clean(o)||{};this.mem[this.id]=this.mem[this.id]||{pr:{}};Object.assign(this.mem[this.id].pr,c);
+  if(this.isOwner&&c.lk!==undefined)this.F.fn.update(this.info,{lk:c.lk?1:0}).catch(e=>this.rep('room info',e));
+  for(const k of PRES_KEYS)if(c[k]!==undefined&&c[k]!==null)this.pend[k]=c[k];
+  this.notify();const gap=this.clk()-this.lastF;if(gap>=100)return this.flush();if(!this.ft)this.ft=setTimeout(()=>{this.ft=0;this.flush()},100-gap)}
+ flush(){if(this.dead||!this.mref)return;const p=this.pend;this.pend={};this.lastF=this.clk();if(!Object.keys(p).length)return;return this.F.fn.update(this.mref,p).catch(e=>this.rep('members/'+(this.id||'').slice(0,6),e))}
+ emit(e,d){if(this.dead)return;const f=this.F.fn;
+  if(e=='chat'){const r=f.push(this.msr);f.set(r,{uid:this.id,name:String(d.n||'').slice(0,24),c:d.c|0,text:String(d.t||'').slice(0,120),ts:this.now(),mid:String(d.id||'').slice(0,64)}).catch(x=>this.rep('messages',x));return}
+  const r=f.push(this.evr);f.set(r,{uid:this.id,type:String(e).slice(0,24),data:clean(d),t:this.now()}).catch(x=>this.rep('events',x));setTimeout(()=>{f.remove(r).catch(()=>{})},8000)}
  closed(){if(this.dead)return;this.dead=true;this.destroy();this.onClose&&this.onClose()}
  destroy(){clearTimeout(this.ft);clearTimeout(this.nt);this.un.forEach(u=>{try{u()}catch(e){}});this.un=[]}
- async leave(){if(this.dead)return;this.dead=true;this.destroy();const f=this.F.fn;try{if(this.host)await f.remove(this.rr);else if(this.mref)await f.remove(this.mref)}catch(e){}}
+ async leave(){if(this.dead)return;this.dead=true;this.destroy();const f=this.F.fn;try{if(this.isOwner)await f.remove(this.rr);else if(this.mref)await f.remove(this.mref)}catch(e){this.rep('leave',e)}}
 }
-async function netJoin(c,host){const F=await Promise.race([window.fbReady,new Promise(r=>setTimeout(()=>r(null),10000))]);
- if(!F)throw Object.assign(new Error('net'),{code:'net',detail:'Firebase not loaded'});
+async function netJoin(c,owner){const F=await Promise.race([window.fbReady,new Promise(r=>setTimeout(()=>r(null),10000))]);
+ if(!F)throw Object.assign(new Error('net'),{code:'net',detail:'Firebase scripts did not load (check your connection / ad blocker)'});
  if(!F.ok)throw Object.assign(new Error('net'),{code:'net',detail:F.why||'Firebase not configured'});
- const r=new FbRoom(F,c,host);await r.open();return r}
+ const r=new FbRoom(F,c,owner);await r.open();return r}
 
 /* ================= HELPERS ================= */
 function mk(s){return()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
@@ -565,7 +591,7 @@ $('bCopy').onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(code)
 $('bStart').onclick=()=>{audio();if(room){if(!allRdy())return;const at=room.now()+1500;lastStart=at;room.presence({startAt:at,lv:lvI});room.emit('start',{at,lv:lvI});startGame(at-room.so,lvI)}else{seed='solo'+Math.random();startGame(Date.now()+400,lvI)}};
 
 async function enter(c,host){code=c;isHost=host;seed=c;
- room=await netJoin(c,host);room.onClose=roomLost;myRdy=host?1:0;
+ room=await netJoin(c,host);room.onClose=roomLost;room.onError=m=>{toast('⚠ Multiplayer: '+m,6000);err('Multiplayer: '+m)};if(!room.clockOk)toast('⚠ Clock sync unavailable',4000);myRdy=host?1:0;
  room.onPeers(onP);
  room.on('start',m=>{if(!m.isMe&&mode!='play'){lastStart=m.data.at;startGame(m.data.at-room.off,m.data.lv)}});
  room.on('take',m=>{if(m.isMe)return;const it=IM[m.data.id];if(it&&it.alive){it.alive=false;it.m.visible=false}});
@@ -575,8 +601,8 @@ async function enter(c,host){code=c;isHost=host;seed=c;
  room.on('sleep',m=>{if(!m.isMe)beginSleep(m.data.J,m.data.B,m.data.nm)});
  room.on('revive',m=>{if(P&&m.data.to===myId()&&P.dead)revive(m.data.hp,m.data.nm)});
  room.on('burst',m=>{if(!m.isMe&&OBJ)ring(m.data.x,m.data.y,m.data.z)});
- await room.presence({ch:hero,host:host?1:0,lv:lvI,nm:nick,rdy:host?1:0,lk:0});
- if(!host){let ok=false;for(let i=0;i<16&&!ok;i++){await new Promise(r=>setTimeout(r,250));ok=room.peers().some(p=>!p.isMe&&p.presence&&p.presence.host===1)}
+ await room.presence({ch:hero,lv:lvI,nm:nick,rdy:host?1:0,lk:0});
+ if(!host){let ok=false;for(let i=0;i<16&&!ok;i++){await new Promise(r=>setTimeout(r,250));ok=room.peers().some(p=>!p.isMe&&p.presence&&p.presence.owner===1)}
   if(!ok){await room.leave();room=null;$('bGo').textContent='Join';throw Object.assign(new Error('nf'),{code:'notfound'})}}
  mode='lobby';$('code').textContent=c;$('bGo').textContent='Join';$('jr').classList.add('hide');joinT=Date.now();showChat(true);setChat(true);chatSys('Room '+c);showSetup();onP({peers:room.peers(),left:[]})}
 const myId=()=>{const p=room&&room.peers().find(p=>p.isMe);return p&&p.peer};
@@ -589,14 +615,13 @@ function toLobby(){resetPlayView();mode='lobby';myRdy=isHost?1:0;if(room)room.pr
 
 /* ================= multiplayer sync ================= */
 function onP(ch){const ps=(ch&&ch.peers)||[];if(room)updRdy();
- $('plist').innerHTML=ps.map(p=>`<span class="pchip">${p.isMe?'⭐':'👤'} ${esc(pname(p))} · ${CH[(p.presence||{}).ch|0]?.ic||''} ${(p.presence||{}).host?'👑':((p.presence||{}).rdy?'✅':'⏳')}</span>`).join('');
+ $('plist').innerHTML=ps.map(p=>`<span class="pchip">${p.isMe?'⭐':'👤'} ${esc(pname(p))} · ${CH[(p.presence||{}).ch|0]?.ic||''} ${(p.presence||{}).owner?'👑':((p.presence||{}).rdy?'✅':'⏳')}</span>`).join('');
  $('pl').innerHTML=ps.map(p=>{const pr=p.presence||{};return `<span class="pchip">${pr.dead?'💀':'🟢'} ${esc(pname(p))} ${pr.dead?'':(pr.hp??'')}</span>`}).join('');
  const ids={};ps.forEach(p=>ids[p.peer]=pname(p));
  for(const k in ids)if(!(k in prevIds)&&Object.keys(prevIds).length)chatSys(ids[k]+' joined');
  for(const k in prevIds)if(!(k in ids))chatSys(prevIds[k]+' left');prevIds=ids;
- const h=ps.find(p=>(p.presence||{}).host===1);
+ const h=ps.find(p=>(p.presence||{}).owner===1);
  if(mode=='lobby'&&!isHost&&h){const pr=h.presence;if(pr.lv!=null&&pr.lv!==lvI){lvI=pr.lv|0;levelCards()}if(pr.startAt&&pr.startAt!==lastStart&&pr.startAt>(Date.now()+room.so)-5000){lastStart=pr.startAt;startGame(pr.startAt-room.off,pr.lv|0)}}
-  ps.forEach(p=>{if(!p.isMe&&p.presence&&p.presence.cm)recvChat(p.presence.cm,true)});
  const seen={};ps.forEach(p=>{const pr=p.presence||{};if(p.isMe||pr.x==null||mode!='play')return;seen[p.peer]=1;let o=remotes[p.peer];
   if(!o){const g=person(CH[pr.ch|0]||CH[0]);g.add(label(pname(p)));sc.add(g);o=remotes[p.peer]={g,sp:0,id:p.peer};g.position.set(pr.x,pr.y,pr.z)}
   Object.assign(o,{tx:pr.x,ty:pr.y,tz:pr.z,yaw:pr.yaw||0,dead:pr.dead,act:pr.act,name:pname(p)})});
@@ -617,7 +642,7 @@ function chatMsg(n,c,t,sys,mine){chLog.appendChild(addLine(n,c,t,sys));while(chL
  if(!sys&&!mine)sfx.chat()}
 const chatSys=t=>chatMsg('',0,t,true);
 $('chF').onsubmit=e=>{e.preventDefault();const t=chIn.value.trim();if(!t)return;if(Date.now()-lastSend<500)return;lastSend=Date.now();chIn.value='';
- const id=(myId()||'x')+Date.now()+Math.random().toString(36).slice(2,5),cm={id,n:myName(),c:hero,t,ts:Date.now()};seenMsg.add(id);chatMsg(myName(),hero,t,false,true);if(!touchUI&&mode=='play')chIn.blur();if(room){room.emit('chat',cm);room.presence({cm})}else if(!/^\(solo\)/.test(t))chatSys('(solo — no one hears you)')};
+ const id=(myId()||'x')+Date.now()+Math.random().toString(36).slice(2,5),cm={id,n:myName(),c:hero,t,ts:Date.now()};seenMsg.add(id);chatMsg(myName(),hero,t,false,true);if(!touchUI&&mode=='play')chIn.blur();if(room){room.emit('chat',cm)}else if(!/^\(solo\)/.test(t))chatSys('(solo — no one hears you)')};
 $('chBig').onpointerdown=e=>e.stopPropagation();$('chBig').onclick=e=>{e.stopPropagation();chat.classList.toggle('big');clampChat()};
 const hd=$('chH');let dg=null;
 hd.addEventListener('pointerdown',e=>{if(e.target.closest('#chBig'))return;hd.setPointerCapture(e.pointerId);const r=chat.getBoundingClientRect();dg={dx:e.clientX-r.left,dy:e.clientY-r.top,sx:e.clientX,sy:e.clientY,mv:false}});
@@ -921,14 +946,14 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/fireba
 import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import { getDatabase, ref, child, set, update, remove, get, push, onValue, onChildAdded, onChildChanged, onChildRemoved, onDisconnect, query, orderByKey, startAfter, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
-// >>> Paste the values from Firebase console → Project settings → Your apps → SDK setup and configuration.
-// >>> Replace every "PASTE_..." value. databaseURL is already set.
+// >>> Replace the 3 "PASTE_..." values with the ones from Firebase console →
+// >>> Project settings → General → Your apps → Web app → SDK setup and configuration → Config.
 const firebaseConfig = {
   apiKey: "AIzaSyAMNNd8E7M_qjPZ2SEz3nPx1aYlLP6Pz_c",
   authDomain: "world-quest-123bd.firebaseapp.com",
   databaseURL: "https://world-quest-123bd-default-rtdb.firebaseio.com",
   projectId: "world-quest-123bd",
-  storageBucket: "world-quest-123bd.firebasestorage.app",
+  storageBucket: "world-quest-123bd.appspot.com",
   messagingSenderId: "484688297247",
   appId: "1:484688297247:web:aa282e948ecdfad917c42a"
 };
@@ -937,7 +962,7 @@ try {
   const configured = !/PASTE_/.test(firebaseConfig.apiKey + firebaseConfig.appId);
   const app = initializeApp(firebaseConfig);
   window.__fbRes({
-    ok: configured, why: configured ? "" : "add your Firebase apiKey and appId",
+    ok: configured, why: configured ? "" : "firebaseConfig still contains PASTE_ placeholders (apiKey / appId) - see the end of index.html",
     db: getDatabase(app), auth: getAuth(app),
     fn: { signInAnonymously, ref, child, set, update, remove, get, push, onValue, onChildAdded, onChildChanged, onChildRemoved, onDisconnect, query, orderByKey, startAfter, runTransaction }
   });
